@@ -1,0 +1,177 @@
+name: Build, Push & Deploy
+
+# Pull Request -> Validation (pr.yml) -> Review (branch protection,
+# required PR approval) -> Merge -> this workflow: Build -> Push ->
+# Deploy -> Health Check.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write # required for OIDC — no long-lived AWS keys anywhere in this repo
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+
+jobs:
+  build-and-push:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        run: echo "image_tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      # Pushing needs an ECR repo to push to. We push the SAME image
+      # once to a shared build cache, then each environment job below
+      # re-tags/pushes it into its OWN environment-scoped ECR repo
+      # using that environment's own deploy role — build/test/scan
+      # never needs deploy credentials at all.
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg GIT_COMMIT=${{ github.sha }} \
+            --build-arg APP_VERSION=${{ steps.tag.outputs.image_tag }} \
+            --build-arg BUILD_NUMBER=${{ github.run_number }} \
+            -t finzla-assessment:${{ steps.tag.outputs.image_tag }} .
+          docker save finzla-assessment:${{ steps.tag.outputs.image_tag }} -o /tmp/image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  deploy-dev:
+    name: Deploy to dev
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: development # GitHub Environment: no required reviewers, auto-deploys
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-image
+          path: /tmp
+
+      - name: Configure AWS credentials (dev deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Load, tag & push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          docker load -i /tmp/image.tar
+          docker tag finzla-assessment:${IMAGE_TAG} ${ECR_REGISTRY}/finzla-dev:${IMAGE_TAG}
+          docker push ${ECR_REGISTRY}/finzla-dev:${IMAGE_TAG}
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition finzla-dev \
+            --query taskDefinition > task-def.json
+
+      - name: Render new image into task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: finzla-dev
+          image: ${{ steps.ecr.outputs.registry }}/finzla-dev:${{ needs.build-and-push.outputs.image_tag }}
+
+      # Registers the new task definition revision and updates the
+      # service, then WAITS for `services-stable` — i.e. the new
+      # tasks must pass their ECS health check and register healthy
+      # in the ALB target group. This is the pipeline's health-check
+      # gate; the job fails if that never happens.
+      - name: Deploy to ECS & wait for health
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: finzla-dev
+          cluster: finzla-dev-cluster
+          wait-for-service-stability: true
+
+      - name: On failure, show recent service events
+        if: failure()
+        run: |
+          echo "Deployment did not stabilise. ECS deployment_circuit_breaker.rollback=true means"
+          echo "the service has already rolled back to the previous task definition automatically."
+          aws ecs describe-services --cluster finzla-dev-cluster --services finzla-dev \
+            --query 'services[0].events[0:10]'
+
+  deploy-prod:
+    name: Deploy to prod
+    needs: [build-and-push, deploy-dev]
+    runs-on: ubuntu-latest
+    # This GitHub Environment has required reviewers configured in
+    # repo settings. The job — and the OIDC token it would present to
+    # AWS carrying `environment:production` in its `sub` claim — does
+    # not exist until someone with the right permissions approves it.
+    # See README "What prevents ... from freely deploying into production?"
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-image
+          path: /tmp
+
+      - name: Configure AWS credentials (prod deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Load, tag & push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          docker load -i /tmp/image.tar
+          docker tag finzla-assessment:${IMAGE_TAG} ${ECR_REGISTRY}/finzla-prod:${IMAGE_TAG}
+          docker push ${ECR_REGISTRY}/finzla-prod:${IMAGE_TAG}
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition finzla-prod \
+            --query taskDefinition > task-def.json
+
+      - name: Render new image into task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: finzla-prod
+          image: ${{ steps.ecr.outputs.registry }}/finzla-prod:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Deploy to ECS & wait for health
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: finzla-prod
+          cluster: finzla-prod-cluster
+          wait-for-service-stability: true
+
+      - name: On failure, show recent service events
+        if: failure()
+        run: |
+          echo "Deployment did not stabilise — ECS has automatically rolled back to the"
+          echo "previous task definition (deployment_circuit_breaker.rollback=true)."
+          aws ecs describe-services --cluster finzla-prod-cluster --services finzla-prod \
+            --query 'services[0].events[0:10]'
