@@ -8,6 +8,7 @@ module "vpc" {
   source = "../../modules/vpc"
 
   name                 = local.name
+  cidr_block           = "10.20.0.0/16"
   azs                  = local.azs
   public_subnet_cidrs  = ["10.20.0.0/24", "10.20.1.0/24"]
   private_subnet_cidrs = ["10.20.10.0/24", "10.20.11.0/24"]
