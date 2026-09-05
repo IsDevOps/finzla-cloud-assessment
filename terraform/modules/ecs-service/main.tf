@@ -126,6 +126,16 @@ resource "aws_ecs_task_definition" "this" {
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
+  # Explicit rather than relying on the (matching) Fargate default:
+  # images must be built for linux/amd64. CI runners are amd64 already;
+  # building locally on Apple Silicon needs `docker buildx build
+  # --platform linux/amd64` or the task fails immediately with an
+  # exec-format error.
+  runtime_platform {
+    cpu_architecture        = "X86_64"
+    operating_system_family = "LINUX"
+  }
+
   container_definitions = jsonencode([
     {
       name      = var.name
