@@ -51,6 +51,12 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: development # GitHub Environment: no required reviewers, auto-deploys
+    # Skips cleanly (not a failure) until infra exists and this variable is
+    # set — see README "Deploying this for real". Without this guard every
+    # push to main would show a hard failure for a chicken-and-egg reason
+    # (the deploy role doesn't exist before terraform apply creates it),
+    # which reads as a broken pipeline rather than an unconfigured one.
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -121,6 +127,9 @@ jobs:
     # not exist until someone with the right permissions approves it.
     # See README "What prevents ... from freely deploying into production?"
     environment: production
+    # Same reasoning as deploy-dev's guard — this checks the `production`
+    # Environment's own AWS_DEPLOY_ROLE_ARN, independently of dev's.
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
