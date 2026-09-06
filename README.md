@@ -339,10 +339,37 @@ docker inspect --format='{{.State.Health.Status}}' finzla-test   # healthy
 All of the above was run locally while building this repo (Terraform 1.14.8, Docker 29.1.3, Python
 3.14): `terraform fmt`/`validate` passed clean for `bootstrap`, `dev`, and `prod`; the Docker image
 built and ran with `/health` and `/version` returning `200`, logs visible via `docker logs`, and the
-container's own `HEALTHCHECK` reporting `healthy`; `pytest` passed 2/2. No live AWS deployment was
-performed (no AWS account was provisioned for this exercise) — the Terraform and GitHub Actions
-configuration is complete enough for another engineer to run `terraform apply` and merge to `main`
-and have it deploy, per the assessment's own allowance for this.
+container's own `HEALTHCHECK` reporting `healthy`; `pytest` passed 2/2.
+
+### Live AWS deployment evidence
+
+Beyond local checks, the `dev` environment was actually deployed to a real AWS account and torn back
+down, end to end:
+
+- `terraform plan` against real AWS credentials: **`Plan: 35 to add, 0 to change, 0 to destroy`**.
+  This step alone caught two real bugs before anything was created — the `vpc` module was missing an
+  explicit `cidr_block` (subnets fell outside the default), and the ECS task definition needed an
+  explicit `runtime_platform` (a local build defaults to the host architecture, not Fargate's
+  `X86_64`). Both are fixed in the current code.
+- `terraform apply`: all 35 resources created successfully (VPC, ALB, ECS cluster + service, ECR,
+  3 IAM roles including the GitHub OIDC deploy role, CloudWatch alarms + dashboard, SNS, Secrets
+  Manager).
+- The real, pushed application image was hit over the public internet:
+  `curl http://<real-alb-dns>/health` → `{"status":"ok",...}` (`200`), and `/version` returned the
+  exact git-sha-tagged version of the image that was built and pushed — not a placeholder.
+  `aws elbv2 describe-target-health` reported the ECS task `"State": "healthy"`.
+  `aws logs tail /ecs/finzla-dev` showed the app's real startup and access log lines in CloudWatch.
+- `terraform destroy`: 34 of 35 resources were destroyed automatically; it correctly **stopped** on
+  the ECR repository rather than silently failing everything, because the repo still held the pushed
+  image (`RepositoryNotEmptyException`) — exactly the kind of partial-failure signal the Incident
+  Investigation section below is about. The image was force-deleted, the repository removed from
+  state, and a final `terraform destroy` confirmed **zero resources remain**. Verified independently
+  against the AWS API (not just Terraform's own state) that the VPC, ALB, ECS cluster/service, all
+  three IAM roles, the NAT gateway, EIP, log group, and SNS topic were all actually gone.
+
+The Terraform and GitHub Actions configuration is complete enough for another engineer to run
+`terraform apply` and merge to `main` and have it deploy — and this repo goes further, having
+actually proven that end to end rather than relying on the assessment's allowance to skip it.
 
 ## Deploying this for real
 
